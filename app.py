@@ -277,7 +277,7 @@ async def recognize(file: UploadFile = File(...)):
     # tidak ada match yang memenuhi threshold
     logger.info(f"Recognition no match | Best Score: {best_score:.4f} | Similarity: {percentage:.2f}% | Threshold: {THRESHOLD:.4f}")
     raise HTTPException(
-        status_code=404,
+        status_code=400,
         detail={
             "status": "no_match",
             "message": "No matching face found in the database",
