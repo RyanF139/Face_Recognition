@@ -16,7 +16,7 @@ load_dotenv()
 
 FACE_LIB_PATH = os.getenv("FACE_LIB_PATH", "face_library")
 DB_FILE = os.getenv("DB_FILE", "db.json")
-THRESHOLD = float(os.getenv("THRESHOLD", 0.4))
+THRESHOLD = float(os.getenv("THRESHOLD", 0.35))
 MODEL_NAME = os.getenv("MODEL_NAME", "buffalo_l")
 MODEL_CTX = int(os.getenv("MODEL_CTX", -1))
 
