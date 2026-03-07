@@ -2,19 +2,19 @@ pipeline {
     agent { label 'built-in' }
 
     environment {
-        REPO_URL = 'https://github.com/RyanF139/Face_Match.git'
+        REPO_URL = 'https://github.com/RyanF139/Face_Recognition.git'
         BRANCH = 'main'
-        ENV_SOURCE = '/opt/config/face-match/.env'
+        ENV_SOURCE = '/opt/config/face-recognition/.env'
 
-        APP_NAME = 'face-match'
-        IMAGE_NAME = 'face-match-app'
+        APP_NAME = 'face-recognition'
+        IMAGE_NAME = 'face-recognition-app'
         IMAGE_TAG = 'latest'
         FULL_IMAGE = "${IMAGE_NAME}:${IMAGE_TAG}"
 
-        DATA_ROOT = '/opt/data/face-match'
-        FACE_LIB_PATH = '/opt/data/face-match/face_library'
-        DB_PATH = '/opt/data/face-match/db.json'
-        BACKUP_PATH = '/opt/data/face-match/backup'
+        DATA_ROOT = '/opt/data/face-recognition'
+        FACE_LIB_PATH = '/opt/data/face-recognition/face_library'
+        DB_PATH = '/opt/data/face-recognition/db.json'
+        BACKUP_PATH = '/opt/data/face-recognition/backup'
     }
 
     stages {
