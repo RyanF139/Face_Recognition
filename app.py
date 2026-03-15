@@ -12,6 +12,11 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Reque
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+#TAMBAHAN 
+from fastapi.responses import StreamingResponse
+from queue import Queue
+from threading import Thread
+
 load_dotenv()
 
 FACE_LIB_PATH = os.getenv("FACE_LIB_PATH", "face_library")
@@ -20,8 +25,21 @@ THRESHOLD = float(os.getenv("THRESHOLD", 0.35))
 MODEL_NAME = os.getenv("MODEL_NAME", "buffalo_l")
 MODEL_CTX = int(os.getenv("MODEL_CTX", -1))
 
+FACE_CROP_MARGIN = float(os.getenv("FACE_CROP_MARGIN", 0.3))
+FACE_MIN_SIZE = int(os.getenv("FACE_MIN_SIZE", 80))
+FACE_DET_SCORE = float(os.getenv("FACE_DET_SCORE", 0.6))
+FACE_MAX_ANGLE = float(os.getenv("FACE_MAX_ANGLE", 35))
+FACE_BLUR_THRESHOLD = float(os.getenv("FACE_BLUR_THRESHOLD", 20))
+
 FACE_LIB_PATH = "face_library"
 os.makedirs(FACE_LIB_PATH, exist_ok=True)
+
+#TAMBAHAN
+BASE_DIR = "face_capture" 
+FACE_DIR = os.path.join(BASE_DIR, "face") 
+BG_DIR = os.path.join(BASE_DIR, "background")
+os.makedirs(FACE_DIR, exist_ok=True)
+os.makedirs(BG_DIR, exist_ok=True)
 
 app = FastAPI()
 app.mount("/face_library", StaticFiles(directory="face_library"), name="face_library")
@@ -79,23 +97,116 @@ def save_db(db):
     # new_id = max(numbers) + 1
     # return f"FP{str(new_id).zfill(4)}"
 
-# ================= EMBEDDING =================
-def get_embedding(image_bytes):
+def is_real_face(img):
 
-    nparr = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-    if img is None:
-        raise ValueError("Image decode failed")
     faces = model.get(img)
 
     if len(faces) == 0:
-        raise ValueError("No face detected")
+        return False, None
 
-    emb = faces[0].embedding.astype(np.float32)
+    for face in faces:
 
-    # WAJIB normalize untuk cosine
-    emb = emb / np.linalg.norm(emb)
+        x1, y1, x2, y2 = map(int, face.bbox)
+
+        w = x2 - x1
+        h = y2 - y1
+
+        ratio = w / h if h != 0 else 0
+
+        print("score:", face.det_score, "size:", w, h, "ratio:", ratio)
+
+        if face.det_score < FACE_DET_SCORE:
+            continue
+
+        if w < FACE_MIN_SIZE or h < FACE_MIN_SIZE:
+            continue
+
+        if ratio < 0.4 or ratio > 1.6:
+            continue
+
+        face_crop = img[y1:y2, x1:x2]
+
+        if face_crop.size == 0:
+            continue
+
+        gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
+
+        blur = cv2.Laplacian(gray, cv2.CV_64F).var()
+
+        print("blur:", blur)
+
+        if blur < FACE_BLUR_THRESHOLD:
+            continue
+
+        # ================= ANGLE CHECK (SOFT) =================
+
+        try:
+            left_eye = face.kps[0]
+            right_eye = face.kps[1]
+
+            dx = right_eye[0] - left_eye[0]
+            dy = right_eye[1] - left_eye[1]
+
+            angle = abs(math.degrees(math.atan2(dy, dx)))
+
+            print("angle:", angle)
+
+        except:
+            pass
+
+        return True, face
+
+    return False, None
+
+def validate_face(img, face):
+
+    score = getattr(face, "det_score", 1)
+
+    if score < FACE_DET_SCORE:
+        return False
+
+    x1, y1, x2, y2 = map(int, face.bbox)
+
+    bw = x2 - x1
+    bh = y2 - y1
+
+    if bw < FACE_MIN_SIZE or bh < FACE_MIN_SIZE:
+        return False
+
+    if hasattr(face, "pose") and face.pose is not None:
+
+        yaw, pitch, roll = face.pose
+        angle = max(abs(yaw), abs(pitch), abs(roll))
+
+        if angle > FACE_MAX_ANGLE:
+            return False
+
+    face_crop = img[y1:y2, x1:x2]
+
+    if face_crop.size == 0:
+        return False
+
+    gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
+    blur = cv2.Laplacian(gray, cv2.CV_64F).var()
+
+    if blur < FACE_BLUR_THRESHOLD:
+        return False
+
+    return True
+
+# ================= EMBEDDING =================
+def get_embedding(face):
+
+    if face is None:
+        raise ValueError("Face object is None")
+
+    emb = face.embedding.astype(np.float32)
+
+    norm = np.linalg.norm(emb)
+    if norm == 0:
+        raise ValueError("Invalid embedding")
+
+    emb = emb / norm
 
     return emb
 
@@ -128,16 +239,6 @@ async def register_person(
 
     db = load_db()
 
-    # # ================= VALIDASI NAMA =================
-    # if name in db:
-    #     logger.warning(f"Attempted registration with duplicate name: {name}")
-    #     return {
-    #         "status": "error",
-    #         "message": "person already registered",
-    #         "name": name,
-    #         "fpid": db[name]["fpid"]
-    #     }
-
     # ================= CEK FOLDER FDID =================
     face_folder = None
 
@@ -156,7 +257,7 @@ async def register_person(
 
     folder_path = os.path.join("face_library", face_folder)
 
-    # ================= GENERATE FPID JIKA KOSONG =================
+    # ================= GENERATE FPID =================
     if fpid == "string" or not fpid:
         fpid = str(uuid.uuid4())
     else:
@@ -172,28 +273,37 @@ async def register_person(
                 "fpid": fpid
             }
 
-    # ================= SIMPAN FOTO =================
+    # ================= BACA GAMBAR =================
     image_bytes = await file.read()
-    file_path = os.path.join(folder_path, f"{fpid}.jpg")
 
-    with open(file_path, "wb") as f:
-        f.write(image_bytes)
-
-    # ================= EMBEDDING PROCESS =================
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
     if img is None:
         logger.error("Image decode failed during registration")
         raise HTTPException(status_code=400, detail="Image decode failed")
+
+    # ================= VALIDASI WAJAH =================
+    is_face, face = is_real_face(img)
+
+    if not is_face:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "status": "error",
+                "message": "Image is not a valid human face"
+            }
+        )
         
 
-    faces = model.get(img)
-    if len(faces) == 0:
-        logger.error("No face detected during registration")
-        raise HTTPException(status_code=400, detail="No face detected")
+    # ================= SIMPAN FOTO =================
+    file_path = os.path.join(folder_path, f"{fpid}.jpg")
 
-    embeddings = [faces[0].embedding]
+    with open(file_path, "wb") as f:
+        f.write(image_bytes)
+
+    # ================= EMBEDDING =================
+    embeddings = [get_embedding(face)]
 
     embeddings = np.array(embeddings, dtype=np.float32)
     mean_embedding = np.mean(embeddings, axis=0)
@@ -220,25 +330,55 @@ async def register_person(
 # ================= RECOGNIZE =================
 @app.post("/recognize")
 async def recognize(file: UploadFile = File(...)):
+
+    image_bytes = await file.read()
+
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    if img is None:
+        raise HTTPException(status_code=400, detail="Image decode failed")
+
+    # ================= VALIDASI WAJAH =================
+    is_face, face = is_real_face(img)
+
+    if not is_face:
+        logger.error(f"Recognition error: Image is not a valid human face")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "status": "error",
+                "message": "Image is not a valid human face"
+            }
+        )
+    # logger.error(
+    #     f"Image is not a valid human face"
+    # )
+
+    # ================= LOAD DATABASE =================
     db = load_db()
+
     if len(db) == 0:
         logger.warning("Recognition attempt with empty database")
         raise HTTPException(
             status_code=400,
             detail={
-                "status": "error", 
+                "status": "error",
                 "message": "Database empty"
-                }
-            )
-        
-
-    image_bytes = await file.read()
+            }
+        )
 
     try:
-        emb = get_embedding(image_bytes)
+        emb = get_embedding(face)
     except ValueError as e:
         logger.error(f"Recognition error: {str(e)}")
-        raise HTTPException(status_code=400, detail={"status": "error", "message": str(e)})
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "status": "error",
+                "message": str(e)
+            }
+        )
 
     best_match = None
     best_score = -1
@@ -246,6 +386,7 @@ async def recognize(file: UploadFile = File(...)):
     best_fdid = None
 
     for name, data in db.items():
+
         embeddings = data.get("embeddings")
         fpid = data.get("fpid")
         fdid = data.get("fdid")
@@ -254,8 +395,10 @@ async def recognize(file: UploadFile = File(...)):
             continue
 
         for stored_embedding in embeddings:
+
             stored = np.array(stored_embedding, dtype=np.float32)
             stored = stored / np.linalg.norm(stored)
+
             score = float(np.dot(emb, stored))
 
             if score > best_score:
@@ -268,8 +411,11 @@ async def recognize(file: UploadFile = File(...)):
     threshold_percent = (THRESHOLD + 1) / 2 * 100
 
     if best_score > THRESHOLD:
-        # match ditemukan
-        logger.info(f"Recognition success: {best_match} with FPID: {best_fpid} in FDID: {best_fdid} | Cosine Score: {best_score:.4f} | Similarity: {percentage:.2f}%")
+
+        logger.info(
+            f"Recognition success: {best_match} with FPID: {best_fpid} in FDID: {best_fdid} | Cosine Score: {best_score:.4f} | Similarity: {percentage:.2f}%"
+        )
+
         return {
             "status": "success",
             "match": best_match,
@@ -281,8 +427,10 @@ async def recognize(file: UploadFile = File(...)):
             "threshold_percent": round(threshold_percent, 2)
         }
 
-    # tidak ada match yang memenuhi threshold
-    logger.info(f"Recognition no match | Best Score: {best_score:.4f} | Similarity: {percentage:.2f}% | Threshold: {THRESHOLD:.4f}")
+    logger.info(
+        f"Recognition no match | Best Score: {best_score:.4f} | Similarity: {percentage:.2f}% | Threshold: {THRESHOLD:.4f}"
+    )
+
     raise HTTPException(
         status_code=400,
         detail={
@@ -830,3 +978,133 @@ def delete_facelib(fdid: str):
                 }
     logger.warning(f"Attempted to delete face library folder with FDID: {fdid} but folder not found")
     raise HTTPException(status_code=404, detail="FDID not found")
+
+
+
+
+#===================Face Detect========================
+task_queue = Queue(maxsize=500)
+def face_worker():
+
+    logger.info("FACE WORKER STARTED")
+
+    while True:
+
+        task = task_queue.get()
+
+        if task is None:
+            continue
+
+        img, camera_ip, event, timestamp = task
+
+        try:
+
+            faces = model.get(img)
+
+            if len(faces) == 0:
+                continue
+
+            h, w, _ = img.shape
+
+            face_index = 0
+            ts = timestamp.replace(":", "").replace("-", "").replace("T", "_")
+
+            for face in faces:
+
+                if not validate_face(img, face):
+                    continue
+
+                score = getattr(face, "det_score", 1)
+
+                if score < FACE_DET_SCORE:
+                    continue
+
+                x1, y1, x2, y2 = map(int, face.bbox)
+
+                bw = x2 - x1
+                bh = y2 - y1
+
+                if bw < FACE_MIN_SIZE or bh < FACE_MIN_SIZE:
+                    continue
+
+                angle = 0
+                if hasattr(face, "pose") and face.pose is not None:
+
+                    yaw, pitch, roll = face.pose
+                    angle = max(abs(yaw), abs(pitch), abs(roll))
+
+                    if angle > FACE_MAX_ANGLE:
+                        continue
+
+                margin_x = int(bw * FACE_CROP_MARGIN)
+                margin_y = int(bh * FACE_CROP_MARGIN)
+
+                nx1 = max(0, x1 - margin_x)
+                ny1 = max(0, y1 - margin_y)
+                nx2 = min(w, x2 + margin_x)
+                ny2 = min(h, y2 + margin_y)
+
+                face_crop = img[ny1:ny2, nx1:nx2]
+
+                bg_img = img.copy()
+                cv2.rectangle(bg_img, (nx1, ny1), (nx2, ny2), (0,255,0), 2)
+
+                filename = f"{camera_ip}_{ts}_{face_index}.jpg"
+
+                face_path = os.path.join(FACE_DIR, filename)
+                bg_path = os.path.join(BG_DIR, filename)
+
+                cv2.imwrite(face_path, face_crop)
+                cv2.imwrite(bg_path, bg_img)
+
+                face_index += 1
+
+        except Exception as e:
+
+            logger.error(f"FACE WORKER ERROR: {e}")
+
+        task_queue.task_done()
+
+
+# ================= START WORKERS =================
+
+WORKER_COUNT = 3
+
+for _ in range(WORKER_COUNT):
+    Thread(target=face_worker, daemon=True).start()
+
+
+# ================= API =================
+
+@app.post("/face-detect")
+async def detect_face(
+    image: UploadFile = File(...),
+    camera_ip: str = Form(...),
+    event: str = Form(...),
+    timestamp: str = Form(...)
+):
+
+    image_bytes = await image.read()
+
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    if img is None:
+        return {"status": "decode_failed"}
+
+    try:
+
+        task_queue.put_nowait((img, camera_ip, event, timestamp))
+
+        logger.info(
+            f"Face task queued | Camera: {camera_ip} | Event: {event} | Time: {timestamp}"
+        )
+
+    except:
+
+        return {"status": "queue_full"}
+
+    return {
+        "status": "queued",
+        "camera_ip": camera_ip
+    }
