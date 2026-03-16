@@ -8,6 +8,8 @@ import cv2
 import numpy as np
 import insightface
 import logging
+import httpx
+import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Request
 from fastapi.staticfiles import StaticFiles
@@ -29,6 +31,13 @@ FACE_MIN_SIZE      = int(os.getenv("FACE_MIN_SIZE", 80))
 FACE_DET_SCORE     = float(os.getenv("FACE_DET_SCORE", 0.6))
 FACE_MAX_ANGLE     = float(os.getenv("FACE_MAX_ANGLE", 35))
 FACE_BLUR_THRESHOLD = float(os.getenv("FACE_BLUR_THRESHOLD", 20))
+
+WEBHOOK_URL = os.getenv(
+    "WEBHOOK_URL",
+    "https://sumsel.smart-gateway.net/api/webhook/detection"
+)
+FACE_SAVE_LIMIT = int(os.getenv("FACE_SAVE_LIMIT", 300))  # 0 = unlimited
+WORKER_COUNT = int(os.getenv("WORKER_COUNT", 3))
 
 os.makedirs(FACE_LIB_PATH, exist_ok=True)
 
@@ -702,27 +711,155 @@ def delete_facelib(fdid: str):
     raise HTTPException(status_code=404, detail="FDID not found")
 
 
-# ================= FACE DETECT WORKER =================
-task_queue: Queue = Queue(maxsize=500)
+    # # ================= FACE DETECT WORKER =================
+    # task_queue: Queue = Queue(maxsize=500)
 
-def face_worker():
-    logger.info("FACE WORKER STARTED")
+    # def face_worker():
+    #     logger.info("FACE WORKER STARTED")
+    #     while True:
+    #         task = task_queue.get()
+    #         if task is None:   # graceful shutdown signal
+    #             task_queue.task_done()
+    #             break
+
+    #         img, camera_ip, event, timestamp = task
+    #         try:
+    #             faces = model.get(img)
+    #             if not faces:
+    #                 task_queue.task_done()
+    #                 continue
+
+    #             h, w, _ = img.shape
+    #             face_index = 0
+    #             ts = timestamp.replace(":", "").replace("-", "").replace("T", "_")
+
+    #             for face in faces:
+    #                 if not validate_face(img, face):
+    #                     continue
+
+    #                 x1, y1, x2, y2 = map(int, face.bbox)
+    #                 bw, bh = x2 - x1, y2 - y1
+
+    #                 margin_x = int(bw * FACE_CROP_MARGIN)
+    #                 margin_y = int(bh * FACE_CROP_MARGIN)
+    #                 nx1 = max(0, x1 - margin_x)
+    #                 ny1 = max(0, y1 - margin_y)
+    #                 nx2 = min(w, x2 + margin_x)
+    #                 ny2 = min(h, y2 + margin_y)
+
+    #                 face_crop = img[ny1:ny2, nx1:nx2]
+    #                 bg_img    = img.copy()
+    #                 cv2.rectangle(bg_img, (nx1, ny1), (nx2, ny2), (0, 255, 0), 2)
+
+    #                 filename  = f"{camera_ip}_{ts}_{face_index}.jpg"
+    #                 cv2.imwrite(os.path.join(FACE_DIR, filename), face_crop)
+    #                 cv2.imwrite(os.path.join(BG_DIR,   filename), bg_img)
+    #                 face_index += 1
+
+    #         except Exception as e:
+    #             logger.error(f"FACE WORKER ERROR: {e}")
+    #         finally:
+    #             task_queue.task_done()
+
+
+    # WORKER_COUNT = 3
+    # for _ in range(WORKER_COUNT):
+    #     Thread(target=face_worker, daemon=True).start()
+
+
+# @app.post("/face-detect")
+# async def detect_face(
+#     image: UploadFile = File(...),
+#     camera_ip: str = Form(...),
+#     event: str = Form(...),
+#     timestamp: str = Form(...)
+# ):
+#     image_bytes = await image.read()
+#     nparr = np.frombuffer(image_bytes, np.uint8)
+#     img   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+#     if img is None:
+#         return {"status": "decode_failed"}
+
+#     try:
+#         task_queue.put_nowait((img, camera_ip, event, timestamp))
+#         logger.info(f"Task queued | Camera: {camera_ip} | Event: {event} | Time: {timestamp}")
+#     except Full:  # OPT #7: log jelas saat queue penuh
+#         logger.warning(f"Queue full, task dropped | Camera: {camera_ip} | Event: {event}")
+#         return {"status": "queue_full"}
+
+#     return {"status": "queued", "camera_ip": camera_ip}
+
+# ================= FACE DETECT WORKER =================
+task_queue:    Queue = Queue(maxsize=500)
+webhook_queue: Queue = Queue(maxsize=500)
+
+
+def webhook_worker():
+    logger.info("WEBHOOK WORKER STARTED")
+    while True:
+        item = webhook_queue.get()
+        if item is None:
+            webhook_queue.task_done()
+            break
+
+        try:
+            face_bytes, frame_bytes, face_name, frame_name, bbox, score, channel_id, client_id, cctv_name = item
+
+            payload = {
+                "timestamp":  face_name,
+                "bbox":       f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}",
+                "confidence": round(score, 4),
+                "channel_id": channel_id,
+                "client_id":  client_id,
+            }
+
+            log_payload = {
+                "url":        WEBHOOK_URL,
+                "cctv_name":  cctv_name,
+                "face_file":  face_name,
+                "frame_file": frame_name,
+                "data":       payload,
+            }
+            # logger.info(f"[WEBHOOK] Sending:\n{json.dumps(log_payload, indent=4)}")
+
+            resp = requests.post(
+                WEBHOOK_URL,
+                files=[
+                    ("files", (face_name,  face_bytes,  "image/jpeg")),
+                    ("files", (frame_name, frame_bytes, "image/jpeg")),
+                ],
+                data=payload,
+                timeout=10,
+            )
+            logger.info(
+                f"[WEBHOOK OK] {face_name} | cctv={cctv_name} | "
+                f"conf={score:.3f} | status={resp.status_code}"
+            )
+
+        except Exception as e:
+            logger.error(f"[WEBHOOK ERROR] {e}")
+        finally:
+            webhook_queue.task_done()
+
+
+def face_worker(worker_id: int = 1):
+    logger.info(f"FACE WORKER #{worker_id} STARTED")
     while True:
         task = task_queue.get()
-        if task is None:   # graceful shutdown signal
+        if task is None:
             task_queue.task_done()
             break
 
-        img, camera_ip, event, timestamp = task
+        img, channel_id, client_id, timestamp, cctv_name = task
         try:
             faces = model.get(img)
             if not faces:
-                task_queue.task_done()
                 continue
 
             h, w, _ = img.shape
-            face_index = 0
             ts = timestamp.replace(":", "").replace("-", "").replace("T", "_")
+            face_index = 0
 
             for face in faces:
                 if not validate_face(img, face):
@@ -742,9 +879,73 @@ def face_worker():
                 bg_img    = img.copy()
                 cv2.rectangle(bg_img, (nx1, ny1), (nx2, ny2), (0, 255, 0), 2)
 
-                filename  = f"{camera_ip}_{ts}_{face_index}.jpg"
-                cv2.imwrite(os.path.join(FACE_DIR, filename), face_crop)
-                cv2.imwrite(os.path.join(BG_DIR,   filename), bg_img)
+                face_name  = f"{channel_id}_{ts}_{face_index}_face.jpg"
+                frame_name = f"{channel_id}_{ts}_{face_index}_frame.jpg"
+
+                _, face_buf  = cv2.imencode(".jpg", face_crop)
+                _, frame_buf = cv2.imencode(".jpg", bg_img)
+                face_bytes   = face_buf.tobytes()
+                frame_bytes  = frame_buf.tobytes()
+
+                # Simpan ke disk dengan limit per channel_id
+                if FACE_SAVE_LIMIT > 0:
+                    existing = sorted([
+                        f for f in os.listdir(FACE_DIR)
+                        if f.startswith(channel_id + "_")
+                    ])
+                    if len(existing) >= FACE_SAVE_LIMIT:
+                        oldest = existing[0]
+                        try:
+                            os.remove(os.path.join(FACE_DIR, oldest))
+                            os.remove(os.path.join(BG_DIR,   oldest))
+                            logger.info(f"Save limit reached, removed oldest: {oldest}")
+                        except FileNotFoundError:
+                            pass
+
+                cv2.imwrite(os.path.join(FACE_DIR,  face_name),  face_crop)
+                cv2.imwrite(os.path.join(BG_DIR,    frame_name), bg_img)
+
+                # Recognition
+                try:
+                    emb = get_embedding(face)
+                    db  = load_db()
+                    best_name, best_score = "unknown", -1.0
+
+                    for name, data in db.items():
+                        for stored_emb in data.get("embeddings", []):
+                            stored = np.array(stored_emb, dtype=np.float32)
+                            stored /= np.linalg.norm(stored)
+                            score = float(np.dot(emb, stored))
+                            if score > best_score:
+                                best_score, best_name = score, name
+
+                    matched_name = best_name if best_score > THRESHOLD else "unknown"
+                    confidence   = best_score
+
+                except Exception as e:
+                    logger.warning(f"Recognition skipped: {e}")
+                    matched_name = "unknown"
+                    confidence   = 0.0
+
+                logger.info(
+                    f"Face detected | cctv={cctv_name} | channel={channel_id} | "
+                    f"match={matched_name} | conf={confidence:.4f}"
+                )
+
+                if WEBHOOK_URL:
+                    try:
+                        webhook_queue.put_nowait((
+                            face_bytes, frame_bytes,
+                            face_name,  frame_name,
+                            list(map(int, face.bbox)),
+                            confidence,
+                            channel_id,
+                            client_id,
+                            cctv_name,
+                        ))
+                    except Full:
+                        logger.warning(f"Webhook queue full, skipped: {face_name}")
+
                 face_index += 1
 
         except Exception as e:
@@ -753,19 +954,23 @@ def face_worker():
             task_queue.task_done()
 
 
-WORKER_COUNT = 3
-for _ in range(WORKER_COUNT):
-    Thread(target=face_worker, daemon=True).start()
+# Start workers
+for i in range(WORKER_COUNT):
+    Thread(target=face_worker, args=(i + 1,), daemon=True).start()
+
+if WEBHOOK_URL:
+    Thread(target=webhook_worker, daemon=True).start()
 
 
 @app.post("/face-detect")
 async def detect_face(
-    image: UploadFile = File(...),
-    camera_ip: str = Form(...),
-    event: str = Form(...),
-    timestamp: str = Form(...)
+    image_bg:   UploadFile = File(...),
+    channel_id: str        = Form(...),
+    client_id:  str        = Form(...),
+    timestamp:  str        = Form(...),
+    cctv_name:  str        = Form(...),
 ):
-    image_bytes = await image.read()
+    image_bytes = await image_bg.read()
     nparr = np.frombuffer(image_bytes, np.uint8)
     img   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
@@ -773,10 +978,20 @@ async def detect_face(
         return {"status": "decode_failed"}
 
     try:
-        task_queue.put_nowait((img, camera_ip, event, timestamp))
-        logger.info(f"Task queued | Camera: {camera_ip} | Event: {event} | Time: {timestamp}")
-    except Full:  # OPT #7: log jelas saat queue penuh
-        logger.warning(f"Queue full, task dropped | Camera: {camera_ip} | Event: {event}")
+        task_queue.put_nowait((img, channel_id, client_id, timestamp, cctv_name))
+        # logger.info(
+        #     f"Task queued | Channel: {channel_id} | Client: {client_id} | "
+        #     f"Time: {timestamp} | CCTV: {cctv_name}"
+        # )
+    except Full:
+        # logger.warning(
+        #     f"Queue full, task dropped | Channel: {channel_id} | Client: {client_id}"
+        # )
         return {"status": "queue_full"}
 
-    return {"status": "queued", "camera_ip": camera_ip}
+    return {
+        "status":     "queued",
+        "channel_id": channel_id,
+        "client_id":  client_id,
+        "cctv_name":  cctv_name,
+    }
