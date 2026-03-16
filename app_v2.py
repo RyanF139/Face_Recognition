@@ -8,7 +8,6 @@ import cv2
 import numpy as np
 import insightface
 import logging
-import httpx
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Request
@@ -37,7 +36,7 @@ WEBHOOK_URL = os.getenv(
     "https://sumsel.smart-gateway.net/api/webhook/detection"
 )
 FACE_SAVE_LIMIT = int(os.getenv("FACE_SAVE_LIMIT", 300))  # 0 = unlimited
-WORKER_COUNT = int(os.getenv("WORKER_COUNT", 3))
+WORKER_COUNT = int(os.getenv("WORKER_FACE_DETECT", 3))
 
 os.makedirs(FACE_LIB_PATH, exist_ok=True)
 

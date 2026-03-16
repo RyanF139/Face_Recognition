@@ -6,4 +6,4 @@ numpy
 python-multipart
 python-dotenv
 onnxruntime
-httpx
+requests
