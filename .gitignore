@@ -11,3 +11,4 @@ images_checker.py
 face_capture
 __pycache__
 human_count
+yolov8n.pt
