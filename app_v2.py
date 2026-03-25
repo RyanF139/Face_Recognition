@@ -799,39 +799,43 @@ task_queue:    Queue = Queue(maxsize=500)
 webhook_queue: Queue = Queue(maxsize=500)
 
 
+#FIX: Lock per channel_id mencegah race condition pada operasi
+# listdir→remove saat dua worker memproses channel yang sama serentak.
+_face_channel_locks: dict[str, Lock] = {}
+_face_channel_locks_meta = Lock()
+ 
+def _get_face_channel_lock(channel_id: str) -> Lock:
+    with _face_channel_locks_meta:
+        if channel_id not in _face_channel_locks:
+            _face_channel_locks[channel_id] = Lock()
+        return _face_channel_locks[channel_id]
+ 
+ 
+# ================= WEBHOOK WORKER =================
 def webhook_worker():
     logger.info("WEBHOOK WORKER STARTED")
     while True:
         item = webhook_queue.get()
         if item is None:
+            # FIX: task_done() sebelum break agar queue.join() tidak hang.
             webhook_queue.task_done()
             break
-
+ 
         try:
-            face_bytes, frame_bytes, face_name, frame_name, bbox, score, channel_id, client_id, cctv_name = item
-
-            # payload = {
-            #     "timestamp":  face_name,
-            #     "bbox":       f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}",
-            #     "confidence": round(score, 4),
-            #     "channel_id": channel_id,
-            #     "client_id":  client_id,
-            # }
-
+            (face_bytes, frame_bytes, face_name, frame_name,
+             bbox, score, channel_id, client_id, cctv_name) = item
+ 
             payload = {
-                "status":     "success",
-                "type":       "face_detect",
-                "data" : {
-                    "bbox":       f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}",
-                    "confidence": round(score, 4),
-                    "channel_id": channel_id,
-                    "client_id":  client_id,
-                    "cctv_name":  cctv_name,
-                },
-                "timestamp" : face_name,
+                "status": "success",
+                "type":   "face_detect",
+                "bbox":       f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}",
+                "confidence": round(score, 4),
+                "channel_id": channel_id,
+                "client_id":  client_id,
+                "cctv_name":  cctv_name,
+                "timestamp": face_name,
             }
-
-
+ 
             resp = requests.post(
                 WEBHOOK_URL,
                 files=[
@@ -845,18 +849,21 @@ def webhook_worker():
                 f"[WEBHOOK OK] {face_name} | cctv={cctv_name} | "
                 f"conf={score:.3f} | status={resp.status_code}"
             )
-
+ 
         except Exception as e:
             logger.error(f"[WEBHOOK ERROR] {e}")
         finally:
+            # FIX: task_done() selalu dipanggil via finally.
             webhook_queue.task_done()
-
-
+ 
+ 
+# ================= FACE WORKER =================
 def face_worker(worker_id: int = 1):
     logger.info(f"FACE WORKER #{worker_id} STARTED")
     while True:
         task = task_queue.get()
         if task is None:
+            # FIX: task_done() sebelum break — wajib agar queue.join() tidak hang.
             task_queue.task_done()
             break
  
@@ -864,13 +871,15 @@ def face_worker(worker_id: int = 1):
         try:
             faces = model.get(img)
             if not faces:
-                future.set_result(None)   # tidak ada wajah
-                continue
+                # FIX: versi lama langsung 'continue' tanpa task_done().
+                # Sekarang set_result + task_done() diurus oleh finally di bawah.
+                future.set_result(None)
+                continue  # lompat ke finally secara otomatis
  
             h, w, _ = img.shape
             ts = timestamp.replace(":", "").replace("-", "").replace("T", "_")
-            face_index = 0
-            first_result = None           # hasil pertama untuk dikirim ke endpoint
+            face_index   = 0
+            first_result = None
  
             for face in faces:
                 if not validate_face(img, face):
@@ -898,28 +907,33 @@ def face_worker(worker_id: int = 1):
                 face_bytes   = face_buf.tobytes()
                 frame_bytes  = frame_buf.tobytes()
  
-                # Simpan ke disk dengan limit per channel_id
+                # FIX: Gunakan lock per channel_id agar operasi
+                # listdir→remove tidak race condition antar worker.
                 if FACE_SAVE_LIMIT > 0:
-                    existing = sorted([
-                        f for f in os.listdir(FACE_DIR)
-                        if f.startswith(channel_id + "_")
-                    ])
-                    if len(existing) >= FACE_SAVE_LIMIT:
-                        oldest = existing[0]
-                        try:
-                            os.remove(os.path.join(FACE_DIR, oldest))
-                            os.remove(os.path.join(BG_DIR,   oldest))
-                            logger.info(f"Save limit reached, removed oldest: {oldest}")
-                        except FileNotFoundError:
-                            pass
+                    ch_lock = _get_face_channel_lock(channel_id)
+                    with ch_lock:
+                        existing = sorted([
+                            f for f in os.listdir(FACE_DIR)
+                            if f.startswith(channel_id + "_")
+                        ])
+                        if len(existing) >= FACE_SAVE_LIMIT:
+                            oldest = existing[0]
+                            try:
+                                os.remove(os.path.join(FACE_DIR, oldest))
+                                os.remove(os.path.join(BG_DIR,   oldest))
+                                logger.info(f"Save limit reached, removed oldest: {oldest}")
+                            except FileNotFoundError:
+                                pass
  
                 cv2.imwrite(os.path.join(FACE_DIR,  face_name),  face_crop)
                 cv2.imwrite(os.path.join(BG_DIR,    frame_name), bg_img)
  
-                # Recognition
+                # FIX: load_db() di dalam worker dibungkus _db_lock agar tidak
+                # race condition dengan write (register/edit/delete) di main thread.
                 try:
                     emb = get_embedding(face)
-                    db  = load_db()
+                    with _db_lock:
+                        db = load_db()
                     best_name, best_score = "unknown", -1.0
  
                     for name, data in db.items():
@@ -950,14 +964,11 @@ def face_worker(worker_id: int = 1):
                             face_name,  frame_name,
                             list(map(int, face.bbox)),
                             confidence,
-                            channel_id,
-                            client_id,
-                            cctv_name,
+                            channel_id, client_id, cctv_name,
                         ))
                     except Full:
                         logger.warning(f"Webhook queue full, skipped: {face_name}")
  
-                # Simpan hasil pertama untuk dikirim ke endpoint
                 if first_result is None:
                     first_result = {
                         "bbox":       f"{int(face.bbox[0])},{int(face.bbox[1])},{int(face.bbox[2])},{int(face.bbox[3])}",
@@ -970,24 +981,27 @@ def face_worker(worker_id: int = 1):
  
                 face_index += 1
  
-            # Kirim hasil ke endpoint (None jika tidak ada wajah valid)
             future.set_result(first_result)
  
         except Exception as e:
-            logger.error(f"FACE WORKER ERROR: {e}")
+            logger.error(f"FACE WORKER #{worker_id} ERROR: {e}")
             future.set_exception(e)
         finally:
+            # FIX: task_done() ada di finally — dipanggil selalu, baik path
+            # normal, path 'continue' (no face), maupun path exception.
+            # Tanpa ini queue.join() akan hang selamanya.
             task_queue.task_done()
-
-
-# Start workers
+ 
+ 
+# ================= START WORKERS =================
 for i in range(WORKER_COUNT):
     Thread(target=face_worker, args=(i + 1,), daemon=True).start()
-
+ 
 if WEBHOOK_URL:
     Thread(target=webhook_worker, daemon=True).start()
-
-
+ 
+ 
+# ================= ENDPOINT =================
 @app.post("/face-detect")
 async def detect_face(
     image_bg:   UploadFile = File(...),
@@ -1011,7 +1025,9 @@ async def detect_face(
         return {"status": "queue_full"}
  
     try:
-        loop   = asyncio.get_event_loop()
+        # FIX: get_running_loop() menggantikan get_event_loop() yang deprecated
+        # di Python 3.10+.
+        loop   = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, lambda: future.result(timeout=30))
     except Exception as e:
         logger.error(f"Face detect error: {e}")
@@ -1026,8 +1042,8 @@ async def detect_face(
         }
  
     return {
-        "status":    "success",
-        "type":      "face_detect",
+        "status": "success",
+        "type":   "face_detect",
         "data": {
             "bbox":       result["bbox"],
             "confidence": result["confidence"],
