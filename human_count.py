@@ -16,7 +16,7 @@ load_dotenv()
 # ================= CONFIG =================
 WEBHOOK_URL        = os.getenv("WEBHOOK_URL", "https://sumsel.smart-gateway.net/api/webhook/detection")
 HC_SAVE_LIMIT      = int(os.getenv("SAVE_LIMIT", 300))   # 0 = unlimited
-HC_WORKER_COUNT    = int(os.getenv("WORKER_COUNT", 2))
+HC_WORKER_COUNT    = int(os.getenv("WORKER", 2))
 HC_YOLO_MODEL      = os.getenv("HC_YOLO_MODEL", "yolov8n.pt")
 HC_CONFIDENCE      = int(os.getenv("HC_CONFIDENCE", 50))     # 1-100
 HC_MODE_CCTV       = os.getenv("HC_MODE_CCTV", "true").lower() == "true"

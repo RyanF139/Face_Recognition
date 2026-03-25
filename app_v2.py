@@ -40,7 +40,7 @@ WEBHOOK_URL = os.getenv(
     "https://sumsel.smart-gateway.net/api/webhook/detection"
 )
 FACE_SAVE_LIMIT = int(os.getenv("SAVE_LIMIT", 300))  # 0 = unlimited
-WORKER_COUNT = int(os.getenv("WORKER_FACE_DETECT", 3))
+WORKER_COUNT = int(os.getenv("WORKER", 3))
 
 os.makedirs(FACE_LIB_PATH, exist_ok=True)
 
