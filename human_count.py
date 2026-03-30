@@ -68,11 +68,12 @@ def hc_webhook_worker():
             break
 
         try:
-            frame_bytes, frame_name, human_count, channel_id, client_id, cctv_name, timestamp = item
+            event_id,frame_bytes, frame_name, human_count, channel_id, client_id, cctv_name, timestamp = item
 
             payload = {
                 "status": "success",
                 "type":   "human_count",
+                "event_id": event_id,
                 "person":     human_count,
                 "channel_id": channel_id,
                 "client_id":  client_id,
@@ -112,7 +113,7 @@ def hc_face_worker(worker_id: int = 1):
             hc_task_queue.task_done()
             break
 
-        img, channel_id, client_id, timestamp, cctv_name, future = task
+        event_id, img, channel_id, client_id, timestamp, cctv_name, future = task
         try:
             results = yolo_model.predict(img, conf=yolo_conf)
 
@@ -179,6 +180,7 @@ def hc_face_worker(worker_id: int = 1):
             if WEBHOOK_URL:
                 try:
                     hc_webhook_queue.put_nowait((
+                        event_id,
                         frame_bytes, frame_name,
                         human_count,
                         channel_id, client_id,
@@ -210,6 +212,7 @@ if WEBHOOK_URL:
 @router.post("/human-count")
 async def human_count_detect(
     image_bg:   UploadFile = File(...),
+    event_id:   str        = Form(...),
     channel_id: str        = Form(...),
     client_id:  str        = Form(...),
     timestamp:  str        = Form(...),
@@ -225,7 +228,7 @@ async def human_count_detect(
     future: Future = Future()
 
     try:
-        hc_task_queue.put_nowait((img, channel_id, client_id, timestamp, cctv_name, future))
+        hc_task_queue.put_nowait((event_id, img, channel_id, client_id, timestamp, cctv_name, future))
     except Full:
         return {"status": "queue_full"}
 
@@ -243,6 +246,7 @@ async def human_count_detect(
     return {
         "status": "success",
         "type":   "human_count",
+        "event_id": event_id,
         "data": {
             "person":     human_count,
             "channel_id": channel_id,

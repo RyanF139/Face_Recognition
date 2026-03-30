@@ -822,12 +822,13 @@ def webhook_worker():
             break
  
         try:
-            (face_bytes, frame_bytes, face_name, frame_name,
+            (event_id,face_bytes, frame_bytes, face_name, frame_name,
              bbox, score, channel_id, client_id, cctv_name) = item
  
             payload = {
                 "status": "success",
                 "type":   "face_detect",
+                "event_id": event_id,
                 "bbox":       f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}",
                 "confidence": round(score, 4),
                 "channel_id": channel_id,
@@ -867,7 +868,7 @@ def face_worker(worker_id: int = 1):
             task_queue.task_done()
             break
  
-        img, channel_id, client_id, timestamp, cctv_name, future = task
+        event_id, img, channel_id, client_id, timestamp, cctv_name, future = task
         try:
             faces = model.get(img)
             if not faces:
@@ -960,6 +961,7 @@ def face_worker(worker_id: int = 1):
                 if WEBHOOK_URL:
                     try:
                         webhook_queue.put_nowait((
+                            event_id,
                             face_bytes, frame_bytes,
                             face_name,  frame_name,
                             list(map(int, face.bbox)),
@@ -1005,6 +1007,7 @@ if WEBHOOK_URL:
 @app.post("/face-detect")
 async def detect_face(
     image_bg:   UploadFile = File(...),
+    event_id:   str        = Form(...),
     channel_id: str        = Form(...),
     client_id:  str        = Form(...),
     timestamp:  str        = Form(...),
@@ -1020,7 +1023,7 @@ async def detect_face(
     future: Future = Future()
  
     try:
-        task_queue.put_nowait((img, channel_id, client_id, timestamp, cctv_name, future))
+        task_queue.put_nowait((event_id,img, channel_id, client_id, timestamp, cctv_name, future))
     except Full:
         return {"status": "queue_full"}
  
@@ -1036,6 +1039,7 @@ async def detect_face(
     if result is None:
         return {
             "status":    "success",
+            "event_id": event_id,
             "type":      "face_detect",
             "data":      None,
             "timestamp": timestamp,
@@ -1044,6 +1048,7 @@ async def detect_face(
     return {
         "status": "success",
         "type":   "face_detect",
+        "event_id": event_id,
         "data": {
             "bbox":       result["bbox"],
             "confidence": result["confidence"],
