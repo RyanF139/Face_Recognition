@@ -823,7 +823,7 @@ def webhook_worker():
  
         try:
             (event_id,face_bytes, frame_bytes, face_name, frame_name,
-             bbox, score, channel_id, client_id, cctv_name) = item
+             bbox, score, channel_id, client_id, cctv_name, timestamp) = item
  
             payload = {
                 "status": "success",
@@ -834,7 +834,7 @@ def webhook_worker():
                 "channel_id": channel_id,
                 "client_id":  client_id,
                 "cctv_name":  cctv_name,
-                "timestamp": face_name,
+                "timestamp": timestamp,
             }
  
             resp = requests.post(
@@ -967,6 +967,7 @@ def face_worker(worker_id: int = 1):
                             list(map(int, face.bbox)),
                             confidence,
                             channel_id, client_id, cctv_name,
+                            timestamp
                         ))
                     except Full:
                         logger.warning(f"Webhook queue full, skipped: {face_name}")
@@ -979,6 +980,7 @@ def face_worker(worker_id: int = 1):
                         "client_id":  client_id,
                         "cctv_name":  cctv_name,
                         "face_name":  face_name,
+                        "timestamp": timestamp,
                     }
  
                 face_index += 1
@@ -1056,7 +1058,7 @@ async def detect_face(
             "client_id":  result["client_id"],
             "cctv_name":  result["cctv_name"],
         },
-        "timestamp": result["face_name"],
+        "timestamp": timestamp,
     }
 
 
