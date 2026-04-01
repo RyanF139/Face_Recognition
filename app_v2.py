@@ -352,6 +352,284 @@ async def recognize(file: UploadFile = File(...)):
     )
 
 
+# @app.post("/recognize/top-k")
+# async def recognize_top_k(
+#     file: UploadFile = File(...),
+#     top_k: int = 5,
+#     min_similarity: float = 0.0  # batas bawah similarity_percent (0.0 - 100.0)
+# ):
+#     # Validasi parameter
+#     if not (0.0 <= min_similarity <= 100.0):
+#         raise HTTPException(
+#             status_code=422,
+#             detail={"status": "error", "message": "min_similarity harus antara 0.0 dan 100.0"}
+#         )
+#     if top_k < 1:
+#         raise HTTPException(
+#             status_code=422,
+#             detail={"status": "error", "message": "top_k harus minimal 1"}
+#         )
+
+#     image_bytes = await file.read()
+#     nparr = np.frombuffer(image_bytes, np.uint8)
+#     img   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+#     if img is None:
+#         raise HTTPException(status_code=400, detail="Image decode failed")
+
+#     is_face, face = is_real_face(img)
+#     if not is_face:
+#         logger.error("Recognition: Image is not a valid human face")
+#         raise HTTPException(
+#             status_code=400,
+#             detail={"status": "error", "message": "Image is not a valid human face"}
+#         )
+
+#     db = load_db()
+#     if not db:
+#         logger.warning("Recognition: empty database")
+#         raise HTTPException(
+#             status_code=400,
+#             detail={"status": "error", "message": "Database empty"}
+#         )
+
+#     try:
+#         emb = get_embedding(face)
+#     except ValueError as e:
+#         logger.error(f"Recognition error: {e}")
+#         raise HTTPException(status_code=400, detail={"status": "error", "message": str(e)})
+
+#     # Konversi min_similarity (persen) ke cosine score
+#     min_cosine = (min_similarity / 100 * 2) - 1
+
+#     # Kumpulkan score terbaik per orang
+#     best_per_person: dict[str, dict] = {}
+
+#     for name, data in db.items():
+#         embeddings = data.get("embeddings")
+#         if not embeddings:
+#             continue
+#         fpid = data.get("fpid")
+#         fdid = data.get("fdid")
+
+#         person_best_score = -1.0
+#         for stored_embedding in embeddings:
+#             stored = np.array(stored_embedding, dtype=np.float32)
+#             stored /= np.linalg.norm(stored)
+#             score = float(np.dot(emb, stored))
+#             if score > person_best_score:
+#                 person_best_score = score
+
+#         # Filter batas bawah sebelum masuk kandidat
+#         if person_best_score < min_cosine:
+#             continue
+
+#         best_per_person[name] = {
+#             "name": name,
+#             "fpid": fpid,
+#             "fdid": fdid,
+#             "cosine_score": person_best_score,
+#         }
+
+#     threshold_percent = (THRESHOLD + 1) / 2 * 100
+
+#     if not best_per_person:
+#         logger.info(
+#             f"Recognition: no candidates above min_similarity={min_similarity}%"
+#         )
+#         raise HTTPException(
+#             status_code=400,
+#             detail={
+#                 "status": "no_candidates",
+#                 "message": f"Tidak ada wajah dengan similarity >= {min_similarity}%",
+#                 "candidates": [],
+#                 "threshold_cosine": THRESHOLD,
+#                 "threshold_percent": round(threshold_percent, 2),
+#                 "top_k": top_k,
+#                 "min_similarity": min_similarity,
+#             }
+#         )
+
+#     # Urutkan ascending, ambil top_k terbaik
+#     sorted_candidates = sorted(
+#         best_per_person.values(),
+#         key=lambda x: x["cosine_score"]
+#     )
+#     top_candidates_asc = sorted_candidates[-top_k:]  # urut terendah → tertinggi
+
+#     # Bangun list kandidat dengan detail lengkap
+#     candidates = []
+#     for c in top_candidates_asc:
+#         score = c["cosine_score"]
+#         percentage = (score + 1) / 2 * 100
+#         candidates.append({
+#             "name": c["name"],
+#             "fpid": c["fpid"],
+#             "fdid": c["fdid"],
+#             "cosine_score": round(score, 4),
+#             "similarity_percent": round(percentage, 2),
+#             "is_match": score > THRESHOLD,
+#         })
+
+#     # Kandidat terbaik = index terakhir (score tertinggi)
+#     best = candidates[-1]
+
+#     if best["is_match"]:
+#         logger.info(
+#             f"Recognition success: {best['name']} | FPID: {best['fpid']} | FDID: {best['fdid']} "
+#             f"| Cosine: {best['cosine_score']:.4f} | Similarity: {best['similarity_percent']:.2f}% "
+#             f"| top_k={top_k} | min_similarity={min_similarity}%"
+#         )
+#         return {
+#             "status": "success",
+#             "best_match": best,
+#             "candidates": candidates,
+#             "threshold_cosine": THRESHOLD,
+#             "threshold_percent": round(threshold_percent, 2),
+#             "top_k": top_k,
+#             "min_similarity": min_similarity,
+#         }
+
+#     logger.info(
+#         f"Recognition: no match | Best Score: {best['cosine_score']:.4f} "
+#         f"| Similarity: {best['similarity_percent']:.2f}% "
+#         f"| top_k={top_k} | min_similarity={min_similarity}%"
+#     )
+#     raise HTTPException(
+#         status_code=400,
+#         detail={
+#             "status": "no_match",
+#             "message": "No matching face found in the database",
+#             "best_match": best,
+#             "candidates": candidates,
+#             "threshold_cosine": THRESHOLD,
+#             "threshold_percent": round(threshold_percent, 2),
+#             "top_k": top_k,
+#             "min_similarity": min_similarity,
+#         }
+#     )
+
+@app.post("/recognize/top-k")
+async def recognize_top_k(
+    file: UploadFile = File(...),
+    top_k: int = 5,
+    min_similarity: float = 0.0  # batas bawah similarity_percent (0.0 - 100.0)
+):
+    # Validasi parameter
+    if not (0.0 <= min_similarity <= 100.0):
+        raise HTTPException(
+            status_code=422,
+            detail={"status": "error", "message": "min_similarity harus antara 0.0 dan 100.0"}
+        )
+    if top_k < 1:
+        raise HTTPException(
+            status_code=422,
+            detail={"status": "error", "message": "top_k harus minimal 1"}
+        )
+
+    image_bytes = await file.read()
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise HTTPException(status_code=400, detail="Image decode failed")
+
+    is_face, face = is_real_face(img)
+    if not is_face:
+        logger.error("Recognition: Image is not a valid human face")
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "error", "message": "Image is not a valid human face"}
+        )
+
+    db = load_db()
+    if not db:
+        logger.warning("Recognition: empty database")
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "error", "message": "Database empty"}
+        )
+
+    try:
+        emb = get_embedding(face)
+    except ValueError as e:
+        logger.error(f"Recognition error: {e}")
+        raise HTTPException(status_code=400, detail={"status": "error", "message": str(e)})
+
+    # Konversi min_similarity (persen) ke cosine score
+    min_cosine = (min_similarity / 100 * 2) - 1
+
+    # Kumpulkan score terbaik per orang
+    best_per_person: dict[str, dict] = {}
+
+    for name, data in db.items():
+        embeddings = data.get("embeddings")
+        if not embeddings:
+            continue
+        fpid = data.get("fpid")
+        fdid = data.get("fdid")
+
+        person_best_score = -1.0
+        for stored_embedding in embeddings:
+            stored = np.array(stored_embedding, dtype=np.float32)
+            stored /= np.linalg.norm(stored)
+            score = float(np.dot(emb, stored))
+            if score > person_best_score:
+                person_best_score = score
+
+        # Filter batas bawah
+        if person_best_score < min_cosine:
+            continue
+
+        best_per_person[name] = {
+            "name": name,
+            "fpid": fpid,
+            "fdid": fdid,
+            "cosine_score": person_best_score,
+        }
+
+    if not best_per_person:
+        logger.info(f"Recognition: no candidates above min_similarity={min_similarity}%")
+        return {
+            "status": "success",
+            "candidates": [],
+            "total": 0,
+            "top_k": top_k,
+            "min_similarity": min_similarity,
+        }
+
+    # Urutkan descending (tertinggi → terendah), ambil top_k terbaik
+    sorted_candidates = sorted(
+        best_per_person.values(),
+        key=lambda x: x["cosine_score"],
+        reverse=True
+    )
+    top_candidates_desc = sorted_candidates[:top_k]
+
+    # Bangun list kandidat
+    candidates = []
+    for c in top_candidates_desc:
+        score = c["cosine_score"]
+        percentage = (score + 1) / 2 * 100
+        candidates.append({
+            "name": c["name"],
+            "fpid": c["fpid"],
+            "fdid": c["fdid"],
+            "cosine_score": round(score, 4),
+            "similarity_percent": round(percentage, 2),
+        })
+
+    logger.info(
+        f"Recognition top-k: found {len(candidates)} candidates "
+        f"| top_k={top_k} | min_similarity={min_similarity}%"
+    )
+
+    return {
+        "status": "success",
+        "candidates": candidates,  # urut terendah → tertinggi
+        "total": len(candidates),
+        "top_k": top_k,
+        "min_similarity": min_similarity,
+    }
+
 # ================= GET ALL PERSONS =================
 @app.get("/persons")
 async def get_persons_all(request: Request):
