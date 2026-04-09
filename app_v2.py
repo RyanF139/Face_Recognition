@@ -20,7 +20,7 @@ from threading import Thread, Lock
 from concurrent.futures import Future
 
 from human_count import router as hc_router
-
+from plat_detect import router as plate_router
 load_dotenv()
 
 FACE_LIB_PATH = os.getenv("FACE_LIB_PATH", "face_library")
@@ -1341,3 +1341,4 @@ async def detect_face(
 
 
 app.include_router(hc_router)
+app.include_router(plate_router)

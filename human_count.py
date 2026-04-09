@@ -14,8 +14,8 @@ from ultralytics import YOLO
 load_dotenv()
 
 # ================= CONFIG =================
-WEBHOOK_URL     = os.getenv("WEBHOOK_URL", "https://sumsel.smart-gateway.net/api/webhook/detection")
-HC_SAVE_LIMIT   = int(os.getenv("SAVE_LIMIT", 300))
+WEBHOOK_URL     = os.getenv("WEBHOOK_URL", "")
+HC_SAVE_LIMIT   = int(os.getenv("SAVE_LIMIT", 10))
 HC_WORKER_COUNT = int(os.getenv("WORKER", 2))
 HC_YOLO_MODEL   = os.getenv("HC_YOLO_MODEL", "yolov8n.pt")
 HC_CONFIDENCE   = int(os.getenv("HC_CONFIDENCE", 50))
@@ -38,17 +38,38 @@ router = APIRouter()
 hc_task_queue:    Queue = Queue(maxsize=500)
 hc_webhook_queue: Queue = Queue(maxsize=500)
 
-# FIX: Lock per channel_id untuk save_limit agar tidak race condition
-# antar worker yang memproses channel yang sama secara bersamaan.
-_hc_channel_locks: dict[str, Lock] = {}
-_hc_channel_locks_meta = Lock()  # melindungi dict _hc_channel_locks itu sendiri
+# ================= GLOBAL LOCK =================
+_hc_global_lock = Lock()
 
-def _get_channel_lock(channel_id: str) -> Lock:
-    """Ambil atau buat lock untuk channel_id tertentu."""
-    with _hc_channel_locks_meta:
-        if channel_id not in _hc_channel_locks:
-            _hc_channel_locks[channel_id] = Lock()
-        return _hc_channel_locks[channel_id]
+
+# ================= CLEANUP =================
+def cleanup_old_files():
+    """Pastikan total file di folder tidak melebihi HC_SAVE_LIMIT"""
+    existing = [
+        f for f in os.listdir(HC_DIR)
+        if f.endswith(".jpg")
+    ]
+
+    logger.info(f"[HC CLEANUP] found={len(existing)} | limit={HC_SAVE_LIMIT}")
+
+    if len(existing) < HC_SAVE_LIMIT:
+        return
+
+    # Sort berdasarkan waktu modifikasi — terlama di index 0
+    existing.sort(key=lambda f: os.path.getmtime(os.path.join(HC_DIR, f)))
+
+    # Hapus kelebihan + buka 1 slot untuk file baru
+    to_delete = existing[:len(existing) - HC_SAVE_LIMIT + 1]
+    logger.info(f"[HC CLEANUP] Hapus {len(to_delete)} file: {to_delete}")
+
+    for filename in to_delete:
+        try:
+            os.remove(os.path.join(HC_DIR, filename))
+            logger.info(f"[HC CLEANUP] Removed: {filename}")
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.error(f"[HC CLEANUP] Gagal hapus {filename}: {e}")
 
 
 # ================= FILTERING PARAMS =================
@@ -68,52 +89,49 @@ def hc_webhook_worker():
             break
 
         try:
-            event_id,frame_bytes, frame_name, human_count, channel_id, client_id, cctv_name, timestamp = item
+            event_id, frame_bytes, frame_name, human_count, channel_id, client_id, cctv_name, timestamp = item
 
             payload = {
-                "status": "success",
-                "type":   "human_count",
-                "event_id": event_id,
+                "status":     "success",
+                "type":       "human_count",
+                "event_id":   event_id,
                 "person":     human_count,
                 "channel_id": channel_id,
                 "client_id":  client_id,
                 "cctv_name":  cctv_name,
-                "timestamp": timestamp,
+                "timestamp":  timestamp,
             }
 
-            resp = requests.post(
+            requests.post(
                 WEBHOOK_URL,
                 files=[("files", (frame_name, frame_bytes, "image/jpeg"))],
                 data=payload,
                 timeout=10,
             )
-            logger.info(
-                f"[HC WEBHOOK OK] {frame_name} | cctv={cctv_name} | "
-                f"count={human_count} | status={resp.status_code}"
-            )
+
+            logger.info(f"[HC WEBHOOK] {frame_name} | count={human_count}")
 
         except Exception as e:
             logger.error(f"[HC WEBHOOK ERROR] {e}")
         finally:
-            # FIX: task_done() selalu dipanggil, termasuk saat error.
             hc_webhook_queue.task_done()
 
 
-# ================= HC WORKER =================
+# ================= WORKER =================
 def hc_face_worker(worker_id: int = 1):
     logger.info(f"HC WORKER #{worker_id} STARTED")
+
     yolo_conf = HC_CONFIDENCE / 100
     fp        = _get_filter_params(HC_MODE_CCTV)
 
     while True:
         task = hc_task_queue.get()
         if task is None:
-            # FIX: task_done() wajib dipanggil sebelum break, agar
-            # hc_task_queue.join() tidak hang saat shutdown.
             hc_task_queue.task_done()
             break
 
         event_id, img, channel_id, client_id, timestamp, cctv_name, future = task
+
         try:
             results = yolo_model.predict(img, conf=yolo_conf)
 
@@ -129,9 +147,9 @@ def hc_face_worker(worker_id: int = 1):
                         continue
 
                     x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-                    w     = x2 - x1
-                    h     = y2 - y1
-                    area  = w * h
+                    w = x2 - x1
+                    h = y2 - y1
+                    area = w * h
                     ratio = w / h if h > 0 else 1
 
                     if w < fp["MIN_W"] or h < fp["MIN_H"]:
@@ -146,48 +164,39 @@ def hc_face_worker(worker_id: int = 1):
                     human_count += 1
                     cv2.rectangle(bg_img, (x1, y1), (x2, y2), (0, 0, 255), 4)
 
-            ts         = timestamp.replace(":", "").replace("-", "").replace("T", "_")
-            frame_name = f"{channel_id}_{ts}_bg.jpg"
+            ts = timestamp.replace(":", "").replace("-", "").replace("T", "_")
+            frame_name = f"{channel_id}_{ts}.jpg"
             frame_path = os.path.join(HC_DIR, frame_name)
 
-            # FIX: Gunakan lock per channel_id agar operasi listdir→remove
-            # tidak race condition ketika 2 worker memproses channel yang sama.
+            # ===== CLEANUP + SAVE DALAM SATU LOCK (ATOMIC) =====
             if HC_SAVE_LIMIT > 0:
-                ch_lock = _get_channel_lock(channel_id)
-                with ch_lock:
-                    existing = sorted([
-                        f for f in os.listdir(HC_DIR)
-                        if f.startswith(channel_id + "_")
-                    ])
-                    if len(existing) >= HC_SAVE_LIMIT:
-                        oldest = existing[0]
-                        try:
-                            os.remove(os.path.join(HC_DIR, oldest))
-                            logger.info(f"[HC] Save limit reached, removed: {oldest}")
-                        except FileNotFoundError:
-                            pass
-
-            cv2.imwrite(frame_path, bg_img)
+                with _hc_global_lock:
+                    cleanup_old_files()
+                    cv2.imwrite(frame_path, bg_img)
+            else:
+                cv2.imwrite(frame_path, bg_img)
 
             _, frame_buf = cv2.imencode(".jpg", bg_img)
             frame_bytes  = frame_buf.tobytes()
 
             logger.info(
-                f"[HC] cctv={cctv_name} | channel={channel_id} | "
-                f"count={human_count} | file={frame_name}"
+                f"[HC] cctv={cctv_name} | channel={channel_id} | count={human_count}"
             )
 
             if WEBHOOK_URL:
                 try:
                     hc_webhook_queue.put_nowait((
                         event_id,
-                        frame_bytes, frame_name,
+                        frame_bytes,
+                        frame_name,
                         human_count,
-                        channel_id, client_id,
-                        cctv_name, timestamp,
+                        channel_id,
+                        client_id,
+                        cctv_name,
+                        timestamp,
                     ))
                 except Full:
-                    logger.warning(f"[HC] Webhook queue full, skipped: {frame_name}")
+                    logger.warning(f"[HC] Webhook queue full")
 
             future.set_result(human_count)
 
@@ -195,14 +204,12 @@ def hc_face_worker(worker_id: int = 1):
             logger.error(f"HC WORKER #{worker_id} ERROR: {e}")
             future.set_exception(e)
         finally:
-            # FIX: task_done() selalu dipanggil via finally, termasuk saat
-            # exception — mencegah hc_task_queue.join() hang selamanya.
             hc_task_queue.task_done()
 
 
 # ================= START WORKERS =================
-for _i in range(HC_WORKER_COUNT):
-    Thread(target=hc_face_worker, args=(_i + 1,), daemon=True).start()
+for i in range(HC_WORKER_COUNT):
+    Thread(target=hc_face_worker, args=(i + 1,), daemon=True).start()
 
 if WEBHOOK_URL:
     Thread(target=hc_webhook_worker, daemon=True).start()
@@ -233,9 +240,6 @@ async def human_count_detect(
         return {"status": "queue_full"}
 
     try:
-        # FIX: get_running_loop() menggantikan get_event_loop() yang deprecated
-        # di Python 3.10+. get_running_loop() lebih eksplisit dan aman karena
-        # hanya valid dipanggil dari dalam coroutine yang sedang berjalan.
         import asyncio
         loop = asyncio.get_running_loop()
         human_count = await loop.run_in_executor(None, lambda: future.result(timeout=30))
