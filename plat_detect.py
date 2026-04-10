@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 import requests
 import cv2
@@ -52,6 +53,12 @@ def _get_channel_lock(channel_id: str) -> Lock:
         return _plate_channel_locks[channel_id]
 
 
+# ================= SANITIZE =================
+def sanitize_filename(value: str) -> str:
+    """Hapus karakter yang tidak valid untuk nama file di Windows & Linux"""
+    return re.sub(r'[\\/:*?"<>|+]', '_', value)
+
+
 # ================= CLEANUP =================
 def cleanup_old_files(channel_id: str):
     """Pastikan hanya simpan N file terbaru"""
@@ -81,7 +88,7 @@ def cleanup_old_files(channel_id: str):
                 except FileNotFoundError:
                     pass
 
-        # logger.info(f"[PLATE] Cleanup removed: {prefix}")
+        logger.info(f"[PLATE] Cleanup removed: {prefix}")
 
 
 # ================= WEBHOOK WORKER =================
@@ -94,39 +101,37 @@ def plate_webhook_worker():
             break
 
         try:
-            event_id, frame_bytes, frame_name, crop_paths, total, channel_id, client_id, cctv_name, timestamp = item
+            event_id, crop_paths, total, channel_id, client_id, cctv_name, timestamp = item
 
-            payload = {
-                "status": "success",
-                "type": "plate_detect",
-                "event_id": event_id,
-                "total_plate": total,
-                "channel_id": channel_id,
-                "client_id": client_id,
-                "cctv_name": cctv_name,
-                "timestamp": timestamp,
-            }
-
-            # Build multipart: frame + semua crop
-            files = [("files", (frame_name, frame_bytes, "image/jpeg"))]
-
+            # Kirim satu request per crop
             for crop_path in crop_paths:
                 crop_name = os.path.basename(crop_path)
                 try:
                     with open(crop_path, "rb") as f:
                         crop_bytes = f.read()
-                    files.append(("crops", (crop_name, crop_bytes, "image/jpeg")))
                 except FileNotFoundError:
                     logger.warning(f"[PLATE WEBHOOK] Crop not found: {crop_path}")
+                    continue
 
-            requests.post(
-                WEBHOOK_URL,
-                files=files,
-                data=payload,
-                timeout=10
-            )
+                payload = {
+                    "status": "success",
+                    "type": "plate_detect",
+                    "event_id": event_id,
+                    "total_plate": total,
+                    "channel_id": channel_id,
+                    "client_id": client_id,
+                    "cctv_name": cctv_name,
+                    "timestamp": timestamp,
+                }
 
-            logger.info(f"[PLATE WEBHOOK] {frame_name} | total={total} | crops sent={len(crop_paths)}")
+                requests.post(
+                    WEBHOOK_URL,
+                    files=[("files", (crop_name, crop_bytes, "image/jpeg"))],
+                    data=payload,
+                    timeout=10
+                )
+
+                logger.info(f"[PLATE WEBHOOK] Sent crop: {crop_name}")
 
         except Exception as e:
             logger.error(f"[PLATE WEBHOOK ERROR] {e}")
@@ -154,7 +159,8 @@ def plate_worker(worker_id: int = 1):
             draw_img = img.copy()
             crop_paths = []
 
-            ts = str(timestamp)
+            # Sanitize timestamp agar aman dijadikan nama file
+            ts = sanitize_filename(str(timestamp))
             plate_index = 0
 
             for r in results:
@@ -165,10 +171,10 @@ def plate_worker(worker_id: int = 1):
                     logger.info(f"[PLATE] Detected conf={conf:.2f} | threshold={conf_thres:.2f}")
 
                     if conf < conf_thres:
-                        # logger.warning(f"[PLATE] SKIPPED — conf={conf:.2f} < threshold={conf_thres:.2f}")
+                        logger.warning(f"[PLATE] SKIPPED — conf={conf:.2f} < threshold={conf_thres:.2f}")
                         continue
 
-                    # logger.info(f"[PLATE] ACCEPTED — conf={conf:.2f}")
+                    logger.info(f"[PLATE] ACCEPTED — conf={conf:.2f}")
 
                     x1, y1, x2, y2 = map(int, box)
 
@@ -201,22 +207,16 @@ def plate_worker(worker_id: int = 1):
                 with ch_lock:
                     cleanup_old_files(channel_id)
 
-            # Encode frame untuk webhook
-            _, buf = cv2.imencode(".jpg", draw_img)
-            frame_bytes = buf.tobytes()
-
             logger.info(
                 f"[PLATE] cctv={cctv_name} | channel={channel_id} | total={len(crop_paths)}"
             )
 
-            # ===== WEBHOOK =====
-            if WEBHOOK_URL:
+            # ===== WEBHOOK — hanya kirim jika ada crop =====
+            if WEBHOOK_URL and crop_paths:
                 try:
                     plate_webhook_queue.put_nowait((
                         event_id,
-                        frame_bytes,
-                        frame_name,
-                        crop_paths,        # ← list crop paths
+                        crop_paths,
                         len(crop_paths),
                         channel_id,
                         client_id,
