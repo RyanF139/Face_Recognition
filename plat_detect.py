@@ -94,11 +94,11 @@ def plate_webhook_worker():
             break
 
         try:
-            event_id, frame_bytes, frame_name, total, channel_id, client_id, cctv_name, timestamp = item
+            event_id, frame_bytes, frame_name, crop_paths, total, channel_id, client_id, cctv_name, timestamp = item
 
             payload = {
                 "status": "success",
-                "type": "plate_crop",
+                "type": "plate_detect",
                 "event_id": event_id,
                 "total_plate": total,
                 "channel_id": channel_id,
@@ -107,14 +107,26 @@ def plate_webhook_worker():
                 "timestamp": timestamp,
             }
 
+            # Build multipart: frame + semua crop
+            files = [("files", (frame_name, frame_bytes, "image/jpeg"))]
+
+            for crop_path in crop_paths:
+                crop_name = os.path.basename(crop_path)
+                try:
+                    with open(crop_path, "rb") as f:
+                        crop_bytes = f.read()
+                    files.append(("crops", (crop_name, crop_bytes, "image/jpeg")))
+                except FileNotFoundError:
+                    logger.warning(f"[PLATE WEBHOOK] Crop not found: {crop_path}")
+
             requests.post(
                 WEBHOOK_URL,
-                files=[("files", (frame_name, frame_bytes, "image/jpeg"))],
+                files=files,
                 data=payload,
                 timeout=10
             )
 
-            logger.info(f"[PLATE WEBHOOK] {frame_name} | total={total}")
+            logger.info(f"[PLATE WEBHOOK] {frame_name} | total={total} | crops sent={len(crop_paths)}")
 
         except Exception as e:
             logger.error(f"[PLATE WEBHOOK ERROR] {e}")
@@ -137,7 +149,6 @@ def plate_worker(worker_id: int = 1):
         event_id, img, channel_id, client_id, timestamp, cctv_name, future = task
 
         try:
-            # Sama seperti code basic — tanpa conf di predict()
             results = plate_model.predict(img)
 
             draw_img = img.copy()
@@ -190,7 +201,7 @@ def plate_worker(worker_id: int = 1):
                 with ch_lock:
                     cleanup_old_files(channel_id)
 
-            # encode
+            # Encode frame untuk webhook
             _, buf = cv2.imencode(".jpg", draw_img)
             frame_bytes = buf.tobytes()
 
@@ -205,6 +216,7 @@ def plate_worker(worker_id: int = 1):
                         event_id,
                         frame_bytes,
                         frame_name,
+                        crop_paths,        # ← list crop paths
                         len(crop_paths),
                         channel_id,
                         client_id,
@@ -237,7 +249,7 @@ if WEBHOOK_URL:
 
 # ================= ENDPOINT =================
 @router.post("/plate-detect")
-async def plate_crop_plate(
+async def plate_detect(
     image_bg: UploadFile = File(...),
     event_id: str = Form(...),
     channel_id: str = Form(...),
