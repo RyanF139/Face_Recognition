@@ -842,7 +842,7 @@ def cleanup_old_face_files():
         ]:
             try:
                 os.remove(path)
-                logger.info(f"[CLEANUP] Removed: {os.path.basename(path)}")
+                # logger.info(f"[CLEANUP] Removed: {os.path.basename(path)}")
             except FileNotFoundError:
                 pass
 
