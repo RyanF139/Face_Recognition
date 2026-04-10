@@ -236,8 +236,8 @@ if WEBHOOK_URL:
 
 
 # ================= ENDPOINT =================
-@router.post("/plate-crop")
-async def plate_crop_detect(
+@router.post("/plate-detect")
+async def plate_crop_plate(
     image_bg: UploadFile = File(...),
     event_id: str = Form(...),
     channel_id: str = Form(...),
