@@ -15,10 +15,10 @@ load_dotenv()
 
 # ================= CONFIG =================
 WEBHOOK_URL        = os.getenv("WEBHOOK_URL", "")
-PLATE_SAVE_LIMIT   = int(os.getenv("SAVE_LIMIT", 10))  # contoh: 10
+PLATE_SAVE_LIMIT   = int(os.getenv("SAVE_LIMIT", 10))
 PLATE_WORKER_COUNT = int(os.getenv("WORKER", 2))
 PLATE_MODEL_PATH   = os.getenv("PLATE_MODEL", "best.pt")
-PLATE_CONFIDENCE   = int(os.getenv("PLATE_CONFIDENCE", 50))
+PLATE_CONFIDENCE   = int(os.getenv("PLATE_CONFIDENCE", 25))
 
 # ================= DIR =================
 PLATE_DIR = "plate_image"
@@ -63,20 +63,17 @@ def cleanup_old_files(channel_id: str):
     if len(existing) <= PLATE_SAVE_LIMIT:
         return
 
-    # sort berdasarkan waktu file (paling lama dulu)
     existing.sort(key=lambda f: os.path.getmtime(os.path.join(FRAME_DIR, f)))
 
     while len(existing) > PLATE_SAVE_LIMIT:
         oldest = existing.pop(0)
         prefix = oldest.replace(".jpg", "")
 
-        # hapus frame
         try:
             os.remove(os.path.join(FRAME_DIR, oldest))
         except FileNotFoundError:
             pass
 
-        # hapus semua crop terkait
         for f in os.listdir(CROP_DIR):
             if f.startswith(prefix + "_"):
                 try:
@@ -140,7 +137,8 @@ def plate_worker(worker_id: int = 1):
         event_id, img, channel_id, client_id, timestamp, cctv_name, future = task
 
         try:
-            results = plate_model.predict(img, conf=conf_thres)
+            # Sama seperti code basic — tanpa conf di predict()
+            results = plate_model.predict(img)
 
             draw_img = img.copy()
             crop_paths = []
@@ -153,8 +151,13 @@ def plate_worker(worker_id: int = 1):
                 confs = r.boxes.conf.cpu().numpy()
 
                 for box, conf in zip(boxes, confs):
+                    logger.info(f"[PLATE] Detected conf={conf:.2f} | threshold={conf_thres:.2f}")
+
                     if conf < conf_thres:
+                        logger.warning(f"[PLATE] SKIPPED — conf={conf:.2f} < threshold={conf_thres:.2f}")
                         continue
+
+                    logger.info(f"[PLATE] ACCEPTED — conf={conf:.2f}")
 
                     x1, y1, x2, y2 = map(int, box)
 
