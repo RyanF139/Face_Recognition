@@ -88,7 +88,7 @@ def cleanup_old_files(channel_id: str):
                 except FileNotFoundError:
                     pass
 
-        logger.info(f"[PLATE] Cleanup removed: {prefix}")
+        # logger.info(f"[PLATE] Cleanup removed: {prefix}")
 
 
 # ================= WEBHOOK WORKER =================
@@ -131,7 +131,7 @@ def plate_webhook_worker():
                     timeout=10
                 )
 
-                logger.info(f"[PLATE WEBHOOK] Sent crop: {crop_name}")
+                # logger.info(f"[PLATE WEBHOOK] Sent crop: {crop_name}")
 
         except Exception as e:
             logger.error(f"[PLATE WEBHOOK ERROR] {e}")
@@ -171,10 +171,10 @@ def plate_worker(worker_id: int = 1):
                     logger.info(f"[PLATE] Detected conf={conf:.2f} | threshold={conf_thres:.2f}")
 
                     if conf < conf_thres:
-                        logger.warning(f"[PLATE] SKIPPED — conf={conf:.2f} < threshold={conf_thres:.2f}")
+                        # logger.warning(f"[PLATE] SKIPPED — conf={conf:.2f} < threshold={conf_thres:.2f}")
                         continue
 
-                    logger.info(f"[PLATE] ACCEPTED — conf={conf:.2f}")
+                    # logger.info(f"[PLATE] ACCEPTED — conf={conf:.2f}")
 
                     x1, y1, x2, y2 = map(int, box)
 
