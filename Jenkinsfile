@@ -82,6 +82,24 @@ pipeline {
             }
         }
 
+        // 🔥 TAMBAHAN CLEANUP DOCKER > 48 JAM
+        stage('Docker Cleanup (older than 2 days)') {
+            steps {
+                sh '''
+                echo "Cleaning Docker resources older than 48h..."
+
+                # container lama
+                docker container prune -f --filter "until=48h" || true
+
+                # image tidak terpakai
+                docker image prune -a -f --filter "until=48h" || true
+
+                # build cache
+                docker builder prune -a -f --filter "until=48h" || true
+                '''
+            }
+        }
+
         stage('Run New Container') {
             steps {
                 sh '''
